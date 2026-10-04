@@ -15,6 +15,7 @@ from .playback import (
     ChannelCapacityExhausted,
     ChannelExists,
     ChannelMissing,
+    CheckpointNotAllowed,
     CursorRegression,
     PlaybackManager,
     PlaybackSession,
@@ -24,6 +25,7 @@ from .playback import (
 )
 from .solver import Subtitle, solve, validate
 from .storage import (
+    CheckpointExists,
     RevisionConflict,
     SceneRecord,
     SceneStore,
@@ -70,8 +72,17 @@ app = FastAPI(
         "（idle/running/paused/blocked），状态不符 409、未知会话 404，运行中"
         "的两种手动推进 409，其他既有会话操作仍可用并完整串行；驱动状态仅存"
         "单进程内存，旧接口响应不变。"
+        "已开补取通道且自动播放未运行的会话还可按 session_id 与非空 "
+        "checkpoint_id 保存 SQLite 播放存档：存档含完整快照、游标、隐藏集合、"
+        "通道未确认事件与 next_seq/acked_seq/max_returned_seq 序号边界，与同"
+        "会话操作串行，成功不结束会话、失败不留存档；未开通道或自动播放运行"
+        "中返回 409，同名存档 409，未知会话 404，非法 id 422。按存档可恢复"
+        "为全新 session_id 的独立会话（不读取当前场景）：队列计入共享容量，"
+        "不足 503 且不留会话或容量占用，并发不超额；事件、序号与确认边界保留，"
+        "idle 仍为 idle、paused/blocked 恢复为 paused，续播重新计时、不追赶"
+        "离线时间；存档可重复恢复，后续操作不改存档或其他会话。"
     ),
-    version="1.10.1",
+    version="1.11.0",
 )
 
 
@@ -456,6 +467,82 @@ class AutoplayStateResponse(BaseModel):
         ..., description="自动播放状态：未启动/运行/暂停/阻塞"
     )
     cursor_ms: int = Field(..., description="当前播放游标（毫秒）")
+
+
+class CheckpointSaveResponse(BaseModel):
+    """播放存档保存结果：存档/会话 id、播放状态与存档时的通道序号边界。
+
+    成功存档不结束会话：原会话、游标、隐藏集合与通道队列完全不变，
+    可继续推进或用其他 checkpoint_id 再次存档。autoplay_status 与 status
+    同义（存档只允许 idle/paused/blocked，运行中返回 409）。
+    """
+
+    checkpoint_id: str
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    status: Literal["idle", "paused", "blocked"] = Field(
+        ..., description="存档时的自动播放状态（运行中不可存档）"
+    )
+    autoplay_status: Literal["idle", "paused", "blocked"] = Field(
+        ..., description="status 的同义字段（与自动播放接口命名一致）"
+    )
+    next_seq: int = Field(
+        ..., description="存档通道的下一事件序号（恢复后新事件从此编号）"
+    )
+    acked_seq: int = Field(..., description="存档时已确认的最大事件序号")
+    max_returned_seq: int = Field(
+        ..., description="存档时补取曾返回过的最大事件序号"
+    )
+    queued_events: int = Field(
+        ..., description="随存档保留的未确认通道事件数（恢复时计入共享容量）"
+    )
+
+
+class CheckpointChannelSnapshot(BaseModel):
+    """恢复后补取通道的确认边界、序号与保留的未确认事件。"""
+
+    acked_seq: int
+    next_seq: int
+    max_returned_seq: int
+    queued_count: int = Field(
+        ..., description="恢复出的未确认事件数（已计入共享容量）"
+    )
+    events: List[ChannelEventOut]
+
+
+class CheckpointRestoreResponse(BaseModel):
+    """按存档恢复的结果：新会话 id、完整快照与播放状态。
+
+    新会话完全独立：session_id 为全新值，快照只取自存档（不读取当前
+    场景）；status 为 idle（存档时未启动）或 paused（存档时暂停/阻塞），
+    续播需显式 resume 且从保留游标重新计时、不追赶离线时间。
+    hidden_speakers 为存档隐藏集合（排序回显）；channel 给出恢复后的
+    确认边界、序号与保留的未确认事件，后续补取与新事件接着 next_seq
+    连续编号。
+    """
+
+    session_id: str = Field(..., description="恢复产生的全新播放会话 id")
+    checkpoint_id: str
+    source_session_id: str = Field(
+        ..., description="存档来源的原会话 id（仅信息用途）"
+    )
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    status: Literal["idle", "paused"] = Field(
+        ..., description="恢复后的自动播放状态（未启动/暂停）"
+    )
+    autoplay_status: Literal["idle", "paused"] = Field(
+        ..., description="status 的同义字段（与自动播放接口命名一致）"
+    )
+    track_count: int
+    changes: int
+    hidden_speakers: List[str]
+    subtitles: List[SubtitleOut]
+    assignments: List[TrackAssignment]
+    channel: CheckpointChannelSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -1372,3 +1459,201 @@ def finish_session(session_id: str) -> SessionStateResponse:
     except (SessionMissing, SessionFinished):
         raise _session_gone_404(session_id)
     return SessionStateResponse(**state)
+
+
+# ---------------------------------------------------------------------------
+# 播放存档（checkpoint）：SQLite 存档跨重启恢复，保留未确认显示事件
+# ---------------------------------------------------------------------------
+
+
+_CHECKPOINT_CONFLICT_MESSAGES = {
+    "channel_missing": "保存播放存档前必须先开启补取通道",
+    "autoplay_running": (
+        "自动播放运行中的会话不可存档：请先暂停（暂停/阻塞状态可以存档，"
+        "恢复后以暂停态续播）"
+    ),
+}
+
+
+def _check_checkpoint_id(checkpoint_id: str) -> None:
+    """checkpoint_id 路径参数合法性：非空且不得为纯空白（非法 -> 422）。"""
+    if checkpoint_id.strip() == "":
+        raise HTTPException(
+            status_code=422, detail="checkpoint_id 不能为空或纯空白"
+        )
+
+
+def _save_checkpoint_core(session_id: str, checkpoint_id: str) -> dict:
+    """存档保存的公共实现（供具名 PUT/POST 与集合式 POST 共用）。
+
+    与同会话的一切操作在会话锁内串行序列化；序列化成功后写入 SQLite
+    （BEGIN IMMEDIATE 占用 checkpoint_id），写入失败时会话侧没有任何
+    变更，因此失败天然“不留存档、不改会话”。成功不结束会话。
+    """
+    _check_checkpoint_id(checkpoint_id)
+    session = _get_session_or_404(session_id)
+    try:
+        payload = get_playback().checkpoint_state(session)
+    except SessionFinished:
+        # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
+        raise _session_gone_404(session_id)
+    except CheckpointNotAllowed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": _CHECKPOINT_CONFLICT_MESSAGES.get(
+                    exc.reason, "当前会话状态不允许保存播放存档"
+                ),
+                "reason": exc.reason,
+                "status": exc.status,
+                "session_id": session_id,
+                "checkpoint_id": checkpoint_id,
+            },
+        )
+
+    try:
+        get_store().save_checkpoint(
+            checkpoint_id=checkpoint_id,
+            session_id=session_id,
+            payload=payload,
+        )
+    except CheckpointExists:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "checkpoint_id 已被占用，播放存档必须使用新的 id",
+                "checkpoint_id": checkpoint_id,
+                "session_id": session_id,
+            },
+        )
+
+    channel = payload["channel"]
+    return {
+        "checkpoint_id": checkpoint_id,
+        "session_id": session_id,
+        "scene_id": payload["scene_id"],
+        "source_revision": payload["source_revision"],
+        "cursor_ms": payload["cursor_ms"],
+        "status": payload["autoplay_status"],
+        "autoplay_status": payload["autoplay_status"],
+        "next_seq": channel["next_seq"],
+        "acked_seq": channel["acked_seq"],
+        "max_returned_seq": channel["max_returned_seq"],
+        "queued_events": len(channel["events"]),
+    }
+
+
+@app.put(
+    "/sessions/{session_id}/checkpoints/{checkpoint_id}",
+    response_model=CheckpointSaveResponse,
+)
+@app.post(
+    "/sessions/{session_id}/checkpoints/{checkpoint_id}",
+    response_model=CheckpointSaveResponse,
+)
+def save_session_checkpoint(
+    session_id: str, checkpoint_id: str
+) -> CheckpointSaveResponse:
+    """按 session_id 与 checkpoint_id 保存 SQLite 播放存档。
+
+    存档在会话锁内序列化，包含完整快照（字幕/分轨/changes/source_revision/
+    track_count）、游标、隐藏集合、补取通道未确认事件及
+    next_seq、acked_seq、max_returned_seq 序号边界，与同会话操作串行。
+    存档写入与场景同一个 SQLite（同一具名数据卷，跨容器重启可读）。
+
+    - 仅**已开启补取通道且自动播放不处于运行状态**（idle/paused/blocked）
+      的会话可存档；未开通道（reason=channel_missing）或自动播放运行中
+      （reason=autoplay_running）返回 **409**；
+    - 成功 **200** 不结束会话：原会话、游标、隐藏集合与通道队列完全不变；
+    - checkpoint_id 为空或纯空白返回 **422**；未知或已结束会话返回 **404**；
+      同名存档返回 **409**（先存的那份保留，本次失败不留存档）；
+    - 任何失败都不改会话、不留存档（通道容量也不变化）。
+    """
+    return CheckpointSaveResponse(
+        **_save_checkpoint_core(session_id, checkpoint_id)
+    )
+
+
+class CheckpointCreateBody(BaseModel):
+    """集合式存档请求体：非空 checkpoint_id（与路径参数等价的便捷写法）。"""
+
+    checkpoint_id: str = Field(
+        ..., description="存档 id：非空且尚未被占用"
+    )
+
+    @field_validator("checkpoint_id")
+    @classmethod
+    def _checkpoint_id_not_blank(cls, v: str) -> str:
+        if v.strip() == "":
+            raise ValueError("checkpoint_id 不能为空或纯空白")
+        return v
+
+
+@app.post(
+    "/sessions/{session_id}/checkpoints",
+    response_model=CheckpointSaveResponse,
+)
+def create_session_checkpoint(
+    session_id: str, req: CheckpointCreateBody
+) -> CheckpointSaveResponse:
+    """集合式存档：`POST /sessions/{id}/checkpoints`，请求体给出 checkpoint_id。
+
+    语义与 `PUT/POST /sessions/{id}/checkpoints/{checkpoint_id}` 完全相同：
+    非空非纯空白 id，其余 404/409 语义一致，成功不结束会话。
+    """
+    return CheckpointSaveResponse(
+        **_save_checkpoint_core(session_id, req.checkpoint_id)
+    )
+
+
+def _restore_checkpoint(checkpoint_id: str) -> dict:
+    """按存档恢复为新会话的公共实现（不读取当前场景）。"""
+    _check_checkpoint_id(checkpoint_id)
+    record = get_store().get_checkpoint(checkpoint_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail=f"播放存档 {checkpoint_id!r} 不存在"
+        )
+    try:
+        return get_playback().restore_from_checkpoint(
+            checkpoint_id=record.checkpoint_id,
+            source_session_id=record.session_id,
+            payload=record.payload,
+        )
+    except ChannelCapacityExhausted as exc:
+        # 队列计入共享容量，不足 503：未注册会话、未留容量占用，可在
+        # 确认前缀/结束会话释放容量后用同一存档重新恢复。
+        raise _channel_full_503(exc)
+
+
+@app.post(
+    "/checkpoints/{checkpoint_id}/restore",
+    response_model=CheckpointRestoreResponse,
+)
+def restore_checkpoint(checkpoint_id: str) -> CheckpointRestoreResponse:
+    """按存档 ID 恢复为**全新 session_id** 的播放会话（不读取当前场景）。
+
+    完整快照、游标、隐藏集合、通道未确认事件与 next_seq/acked_seq/
+    max_returned_seq 确认/序号边界全部取自存档：之后新产生的通道事件
+    接着存档的 next_seq 连续编号，补取的越界/不回退语义不变。存档中的
+    未确认事件数原子计入共享容量——不足返回 **503**，且不创建会话、
+    不留任何容量占用；并发恢复由容量原子记账串行化，合计不可能超额。
+
+    自动播放状态：存档时未启动（idle）的恢复后仍未启动；暂停（paused）
+    或阻塞（blocked）的恢复为暂停（paused），需显式 resume 才续播，
+    并以存档保留的游标重新读取单调时钟开新计时段，**不追赶**离线时间。
+
+    同一份存档可重复恢复为多个相互独立的会话：恢复与其后任何会话操作
+    都不修改存档或其他会话。checkpoint_id 非法（空/纯空白）返回 422；
+    未知存档返回 404。响应含新会话 id、完整快照与播放状态。
+    """
+    return CheckpointRestoreResponse(**_restore_checkpoint(checkpoint_id))
+
+
+@app.post(
+    "/sessions/checkpoints/{checkpoint_id}/restore",
+    response_model=CheckpointRestoreResponse,
+)
+def restore_checkpoint_alias(checkpoint_id: str) -> CheckpointRestoreResponse:
+    """`/checkpoints/{checkpoint_id}/restore` 的会话命名空间别名（语义相同）。"""
+    return CheckpointRestoreResponse(**_restore_checkpoint(checkpoint_id))

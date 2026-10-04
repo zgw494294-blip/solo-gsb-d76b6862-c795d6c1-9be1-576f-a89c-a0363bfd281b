@@ -11,6 +11,13 @@
 片段另存（clip）与场景拼接（concat）创建新场景时同样在单个
 BEGIN IMMEDIATE 事务内核对全部源版本并占用目标：版本核对与目标
 创建一同生效，失败不留目标、不改源。
+
+播放存档（playback checkpoint）把某个播放会话的完整播放状态
+（快照、游标、隐藏集合、补取通道队列与序号边界、自动播放状态）
+按调用方给定的 checkpoint_id 写入同库的 playback_checkpoints 表，
+容器重启后仍可读取并据此恢复为全新会话。存档写入与场景写入一样在
+BEGIN IMMEDIATE 事务内占用 id：同名存档并发写入最多一次成功，
+失败不留存档。
 """
 from __future__ import annotations
 
@@ -55,6 +62,33 @@ class SourceSceneMissing(Exception):
         super().__init__(f"源场景 {scene_id!r} 不存在")
 
 
+class CheckpointExists(Exception):
+    """checkpoint_id 已被另一播放存档占用（对应 HTTP 409）。"""
+
+    def __init__(self, checkpoint_id: str) -> None:
+        self.checkpoint_id = checkpoint_id
+        super().__init__(
+            f"播放存档 {checkpoint_id!r} 已存在，存档必须使用新的 checkpoint_id"
+        )
+
+
+class CheckpointMissing(Exception):
+    """checkpoint_id 不存在（对应 HTTP 404）。"""
+
+    def __init__(self, checkpoint_id: str) -> None:
+        self.checkpoint_id = checkpoint_id
+        super().__init__(f"播放存档 {checkpoint_id!r} 不存在")
+
+
+@dataclass
+class CheckpointRecord:
+    """一次播放存档：存档 id、源会话 id 与完整播放状态负载（JSON 反序列化结果）。"""
+
+    checkpoint_id: str
+    session_id: str
+    payload: Dict[str, Any]
+
+
 @dataclass
 class SceneRecord:
     scene_id: str
@@ -94,6 +128,18 @@ class SceneStore:
                     assignments   TEXT    NOT NULL,
                     changes       INTEGER NOT NULL,
                     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                )
+                """
+            )
+            # 播放存档（跨重启续播）：payload 为会话完整播放状态的 JSON。
+            # 存档与场景使用相互独立的 id 空间（不同表）；同名存档插入冲突。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS playback_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    session_id    TEXT NOT NULL,
+                    payload       TEXT NOT NULL,
+                    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 )
                 """
             )
@@ -361,6 +407,69 @@ class SceneStore:
             subtitles=subtitles,
             assignments=assignments,
             changes=row["changes"],
+        )
+
+    def save_checkpoint(
+        self,
+        checkpoint_id: str,
+        session_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """在单个 BEGIN IMMEDIATE 事务内占用 checkpoint_id 并写入播放存档。
+
+        存档一经写入即不可变（不提供更新/删除）：同名 id 的并发或重复
+        写入在事务内发现主键已占用即抛 CheckpointExists 并回滚，失败不留
+        存档、也不影响先成功写入的那份。payload 为调用方在会话锁内序列化
+        的完整播放状态（快照、游标、隐藏集合、通道队列与序号边界、自动
+        播放状态）。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM playback_checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+            if existing is not None:
+                raise CheckpointExists(checkpoint_id)
+            conn.execute(
+                """
+                INSERT INTO playback_checkpoints
+                    (checkpoint_id, session_id, payload)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    checkpoint_id,
+                    session_id,
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+        except CheckpointExists:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_checkpoint(self, checkpoint_id: str) -> Optional[CheckpointRecord]:
+        """按 checkpoint_id 读取播放存档；不存在返回 None。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT checkpoint_id, session_id, payload
+                  FROM playback_checkpoints WHERE checkpoint_id = ?
+                """,
+                (checkpoint_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CheckpointRecord(
+            checkpoint_id=row["checkpoint_id"],
+            session_id=row["session_id"],
+            payload=json.loads(row["payload"]),
         )
 
 

@@ -13,7 +13,9 @@ services:
       # 会让容器启动失败（拒绝启动）。改大可缓冲更多未确认事件。
       CHANNEL_EVENT_LIMIT: "1024"
     volumes:
-      # 具名卷持久化 SQLite 场景数据；容器重启甚至重新创建后仍可读取场景
+      # 具名卷持久化 SQLite 数据；容器重启甚至重新创建后仍可读取场景。
+      # 播放存档（checkpoint）写在同一个 SQLite（playback_checkpoints 表），
+      # 同样随本卷跨重启保留：重启后按存档恢复为新会话即可续播。
       - scenes-data:/data
     restart: unless-stopped
 

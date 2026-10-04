@@ -68,6 +68,16 @@
   串行。暂停返回后在途后台任务进锁即见非 running，不会再推进；结束会话
   即停止对它的驱动（注册表移除后旧任务取不到它），按原规则释放容量，
   之后一切请求 404。驱动状态仅存于本进程内存，不跨重启，旧接口响应不变。
+- 播放存档（checkpoint）：已开启补取通道且自动播放非运行状态的会话可在
+  会话锁内把完整快照、游标、隐藏集合、通道未确认事件与
+  next_seq/acked_seq/max_returned_seq 序号边界序列化为存档负载（由调用方
+  写入 SQLite）；未开通道或自动播放运行中拒绝存档（CheckpointNotAllowed，
+  HTTP 409），序列化与同会话一切操作串行，成功不改变、不结束会话。恢复按
+  存档负载创建全新 session_id 的会话，不读取当前场景：队列按存档事件数
+  原子计入共享容量（不足 ChannelCapacityExhausted，503，不留会话或容量
+  占用，并发不超额）；idle 恢复为 idle，paused/blocked 恢复为 paused，
+  续播从保留游标重新计时、不追赶离线时间；同一份存档可重复恢复为互不
+  影响的独立会话，后续操作不修改存档或其他会话。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
 隐藏切换、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
@@ -312,6 +322,21 @@ class AckOutOfRange(Exception):
             f"ack_seq={ack_seq} 越界：此前补取已返回的最大 seq 为 "
             f"{max_returned_seq}"
         )
+
+
+class CheckpointNotAllowed(Exception):
+    """当前会话状态不允许保存播放存档（对应 HTTP 409）。
+
+    reason 取值：
+    - channel_missing：存档只保存已开启补取通道的会话；
+    - autoplay_running：自动播放运行中的会话不允许存档（暂停/阻塞/未启动
+      的自动播放可以，恢复后的会话以暂停态续播）。
+    """
+
+    def __init__(self, reason: str, status: str) -> None:
+        self.reason = reason
+        self.status = status
+        super().__init__(f"播放存档条件不满足：{reason}（当前状态 {status}）")
 
 
 @dataclass
@@ -768,6 +793,149 @@ class PlaybackManager:
                 "acked_seq": channel.acked_seq,
                 "events": remaining,
             }
+
+    # ------------------------------------------------------------------
+    # 播放存档（checkpoint）：锁内序列化 / 恢复为新会话（队列计入共享容量）
+    # ------------------------------------------------------------------
+
+    def checkpoint_state(self, session: PlaybackSession) -> Dict[str, Any]:
+        """在会话锁内把当前播放状态序列化为可持久化的存档负载。
+
+        仅允许**已开启补取通道且自动播放不处于 running** 的会话存档：
+        未开启通道抛 CheckpointNotAllowed(channel_missing)；运行中抛
+        CheckpointNotAllowed(autoplay_running)；会话已结束抛
+        SessionFinished（404）。本方法只做序列化、不写入存储（由调用方
+        落库）、不改变任何会话状态——成功存档不结束会话。
+
+        与同会话的推进、事件推进、隐藏切换、接纳、结束、通道开启/补取、
+        自动播放控制在会话锁内完整串行，因此序列化出的完整快照、游标、
+        隐藏集合、通道未确认事件与 next_seq/acked_seq/max_returned_seq
+        序号边界是同一份一致状态；随后的存储写入失败只需不落库即可，
+        会话侧没有任何需要回滚的变更。
+        """
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            if session.channel is None:
+                raise CheckpointNotAllowed(
+                    "channel_missing", session.autoplay_status
+                )
+            if session.autoplay_status == AUTOPLAY_RUNNING:
+                raise CheckpointNotAllowed(
+                    "autoplay_running", session.autoplay_status
+                )
+            channel = session.channel
+            return {
+                "scene_id": session.scene_id,
+                "source_revision": session.source_revision,
+                "track_count": session.track_count,
+                "changes": session.changes,
+                "subtitles": [dict(s) for s in session.subtitles],
+                "assignments": [
+                    {"id": s["id"], "track": t}
+                    for s, t in zip(session.subtitles, session.tracks)
+                ],
+                "cursor_ms": session.cursor_ms,
+                # 集合以列表形式持久化（恢复时重新建 set，顺序无关）。
+                "hidden_speakers": list(session.hidden_speakers),
+                # 自动播放的驱动状态可存档部分：运行中不允许存档，因此
+                # 只会是 idle/paused/blocked；单调时钟读数不持久化，恢复
+                # 后未启动/暂停一律从保留游标重新计时，不追赶离线时间。
+                "autoplay_status": session.autoplay_status,
+                "channel": {
+                    "events": [dict(e) for e in channel.events],
+                    "next_seq": channel.next_seq,
+                    "acked_seq": channel.acked_seq,
+                    "max_returned_seq": channel.max_returned_seq,
+                },
+            }
+
+    def restore_from_checkpoint(
+        self,
+        checkpoint_id: str,
+        source_session_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """按存档负载恢复为一个全新的播放会话（不读取当前场景）。
+
+        完整快照（字幕/分轨/changes/source_revision/track_count）、游标、
+        隐藏集合、通道未确认事件与 next_seq/acked_seq/max_returned_seq
+        序号边界全部取自存档；新会话获得全新 session_id，与存档源会话及
+        其他恢复会话相互独立——同一份存档可重复恢复为多个独立会话，恢复
+        及之后的任何会话操作都不修改存档或其他会话。
+
+        通道队列按存档时的未确认事件数计入共享容量：容量不足抛
+        ChannelCapacityExhausted（HTTP 503），此时不注册会话、不留任何
+        容量占用。容量申请在注册表登记之前原子完成，并发恢复不可能超额。
+
+        自动播放状态映射：存档时未启动（idle）恢复后仍未启动；暂停
+        （paused）或阻塞（blocked）恢复为暂停（paused），需要客户端显式
+        resume 才重新计时，并从存档保留的游标开新计时段，不追赶离线时间
+        （运行中的会话本来就不允许存档）。后续补取与新入队事件的序号
+        接着存档的 next_seq 继续编号。
+        """
+        channel_data = payload["channel"]
+        events = channel_data["events"]
+        # 先为存档的未确认队列原子申请共享容量：不足直接失败（503），
+        # 既不创建会话也不留下容量占用；多个并发恢复由此被串行记账，
+        # 合计不可能突破共享上限。
+        self._channel_capacity.reserve(len(events))
+        try:
+            new_id = uuid.uuid4().hex
+            subtitles = [dict(s) for s in payload["subtitles"]]
+            track_by_id = {a["id"]: a["track"] for a in payload["assignments"]}
+            autoplay_status = payload.get("autoplay_status", AUTOPLAY_IDLE)
+            if autoplay_status in (AUTOPLAY_PAUSED, AUTOPLAY_BLOCKED):
+                restored_status = AUTOPLAY_PAUSED
+            else:
+                restored_status = AUTOPLAY_IDLE
+            cursor_ms = payload["cursor_ms"]
+            session = PlaybackSession(
+                session_id=new_id,
+                scene_id=payload["scene_id"],
+                source_revision=payload["source_revision"],
+                track_count=payload["track_count"],
+                subtitles=subtitles,
+                tracks=[track_by_id[s["id"]] for s in subtitles],
+                changes=payload["changes"],
+                cursor_ms=cursor_ms,
+                hidden_speakers=set(payload.get("hidden_speakers", [])),
+                channel=ChannelState(
+                    events=[dict(e) for e in events],
+                    next_seq=channel_data["next_seq"],
+                    acked_seq=channel_data["acked_seq"],
+                    max_returned_seq=channel_data["max_returned_seq"],
+                ),
+                # 恢复即暂停/未启动：不启动后台驱动段；resume 时会以当前
+                # 游标重新读取单调时钟开新计时段（不追赶离线时间）。
+                autoplay_status=restored_status,
+                base_cursor_ms=cursor_ms,
+                base_monotonic_s=0.0,
+            )
+            with self._registry_lock:
+                self._sessions[new_id] = session
+        except BaseException:
+            # 构造或登记异常时归还刚申请的容量，杜绝“占用却没有会话”。
+            self._channel_capacity.release(len(events))
+            raise
+        state = session.state()
+        state.update(
+            {
+                "checkpoint_id": checkpoint_id,
+                "source_session_id": source_session_id,
+                "status": restored_status,
+                "autoplay_status": restored_status,
+                "hidden_speakers": sorted(session.hidden_speakers),
+                "channel": {
+                    "acked_seq": channel_data["acked_seq"],
+                    "next_seq": channel_data["next_seq"],
+                    "max_returned_seq": channel_data["max_returned_seq"],
+                    "queued_count": len(events),
+                    "events": [dict(e) for e in events],
+                },
+            }
+        )
+        return state
 
     # ------------------------------------------------------------------
     # 自动播放：按真实经过时间推进（单进程内存态后台驱动）
