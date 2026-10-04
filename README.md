@@ -13,6 +13,7 @@
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 - 播放会话可开启一个**补取通道（channel）**，让显示端在**推进响应丢失后仍能补取未确认的字幕变更**：`POST /sessions/{id}/channel` 每会话开启一个内存通道（重复开启 409），返回当前可见 `active` 与序号 0；此后普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序入队，`seq` 从 1 连续编号，短字幕不漏记，接纳不重写已排队内容。`POST /sessions/{id}/channel/fetch` 提交 `ack_seq`（严格非负整数，拒绝布尔值与字符串）补取：只能确认此前补取已返回的最大 `seq` 以内的前缀（越界 422，旧确认不回退），返回确认位置与剩余未确认事件（按 `seq` 递增，重复补取内容与序号不变）。状态变更与入队一同生效，开启、补取与既有会话操作完整串行，失败不改会话或通道；结束会话清除通道，未知或已结束会话、未开启通道均 404。通道仅内存态：不跨重启恢复、不做后台推送，旧接口响应不变。**通道共享容量**由环境变量 `CHANNEL_EVENT_LIMIT` 配置（正整数，默认 1024，非法配置拒绝启动，可在 Compose 中配置）：它是**单进程内所有会话未确认事件总量**的上限。普通推进、事件推进与隐藏切换须按**本次实际生成的事件数**原子申请共享容量，申请与状态变更、`seq` 分配、完整入队一同生效；容量不足立即返回 **503**——不推进游标、不改变隐藏集合、不消费 `seq`、不部分入队。**未开启通道的操作不占容量**；**无事件的操作在满额时仍可执行**。容量**仅在补取确认并删除前缀时**按删除数量释放（纯读取与旧确认不释放），或在**结束会话时释放该通道剩余队列**（重复/并发结束不重复释放）；释放后被 503 拒绝的原请求可原样重试。
 - 已开启补取通道的会话还可启动**自动播放（autoplay）**：客户端不再逐次提交推进时间，进程内后台驱动**每 50 毫秒**按真实经过时间自动推进，目标为**本段起始游标 + 单调时钟经过的整毫秒**（`time.monotonic`，毫秒取整）。HTTP 接口按 `session_id` **启动 / 暂停 / 恢复 / 查询**，返回 `idle`（未启动）/ `running`（运行）/ `paused`（暂停）/ `blocked`（满额阻塞）状态与当前游标。启动仅限**已开补取通道且从未启动**的会话（未开通道或已启动返回 409）；暂停仅限 running，恢复仅限 paused 或 blocked，其余状态迁移均 409；未知或已结束会话 404。**暂停、阻塞不计时**，恢复以保留游标作为新一段起点重新计时，**不追赶**停顿时间；启动与恢复的计时段起点在**会话锁内、控制请求串行生效的同一时刻**读取——同会话接纳等操作持锁时，控制请求在锁外等待的间隔不计入计时，生效后不会把等锁时长额外推进到游标上、也不会提前入队字幕事件。后台推进沿用事件窗口、隐藏过滤、排序、`seq` 与共享容量的**全部既有规则**：一次推进的整批事件原子入队，共享容量不足时整批转为 `blocked`——游标、`seq` 与队列保持原样；确认释放容量后**必须显式恢复**才继续，且不追赶停顿。**运行中两种手动推进（`/advance`、`/events`）返回 409**，未启动/暂停/阻塞时仍可手动推进；隐藏切换、接纳、补取等其他既有会话操作在四种状态下仍可用并与后台推进完整串行。暂停返回后在途后台任务进锁即见非 running，不可能再推进；结束会话即停止对它的驱动（注册表移除后旧任务取不到它）、按原规则释放通道容量，之后该 id 一切请求 404。自动播放驱动状态**仅存单进程内存**，不跨重启，旧接口的请求与响应完全不变。
+- 已开启补取通道且自动播放非运行的会话可保存**命名播放存档（checkpoint）**：`POST /sessions/{id}/checkpoints` 把完整快照、游标、隐藏集合、补取通道未确认事件与 `next_seq`/`acked_seq`/`max_returned_seq`、自动播放状态写入**与场景同一个 SQLite 数据库**（同名存档 409、未知会话 404、非法 id 422；保存与同会话操作串行，**成功不结束会话、失败不留存档**）。`POST /checkpoints/{id}/restore` 按存档恢复为**全新 session_id** 的独立会话：**不读取当前场景**，事件、序号与确认边界原样保留，后续事件从 `next_seq` 继续编号；未启动者仍未启动，**暂停或阻塞者恢复为暂停**（续播重新计时、**不追赶离线时间**）；恢复出的队列**计入共享容量**（不足 503 且不留会话或容量占用，并发不超额）；**可重复恢复**，后续操作不改存档或其他会话。存档随场景库落在同一数据卷，**进程重启、容器重建后仍可续播**。
 
 ## 一条命令启动
 
@@ -25,7 +26,7 @@ docker compose up --build -d
 停止：`docker compose down`
 
 > - 交互式查看日志可去掉 `-d`。交互式文档：`http://localhost:8080/docs`（Swagger UI）。
-> - Compose 自动把具名卷 `scenes-data` 挂载到容器内 `/data`：场景数据库（`SCENES_DB_PATH=/data/scenes.db`）在容器重启甚至 `docker compose down && up` 后仍然保留。仅 `docker compose down -v` 删除卷时才会清除场景。
+> - Compose 自动把具名卷 `scenes-data` 挂载到容器内 `/data`：场景数据库（`SCENES_DB_PATH=/data/scenes.db`，场景与播放存档同库）在容器重启甚至 `docker compose down && up` 后仍然保留。仅 `docker compose down -v` 删除卷时才会清除场景与存档。
 > - Compose 还通过环境变量 `CHANNEL_EVENT_LIMIT` 配置补取通道的共享容量（默认 `1024`，正整数；非法配置容器会拒绝启动，详见下文“补取通道”）。
 
 ## 请求
@@ -1885,6 +1886,181 @@ curl -s -o /dev/null -X POST http://localhost:8080/sessions/$SID/finish
 - `running` 时仅禁止两种手动推进（409）；隐藏切换照常（与后台推进串行，显示变更事件照常入队），`/accept` 照常（接纳后后台按新快照继续推进，已开始字幕冻结规则不变），`/channel/fetch` 照常拉取自动推进产生的事件。
 - `paused`/`blocked` 时可手动推进（满额仍 503）、可切换隐藏、可接纳、可补取；这些操作改变的游标就是随后 `resume` 的本段起始游标。
 
+## 播放存档（checkpoint）：跨重启续播，保留未确认显示事件
+
+播放会话本身仍是**单进程内存态**（重启即按未知会话 404），但已开启补取通道的会话可以把当前状态保存为**命名存档**：存档写入与场景**同一个 SQLite 数据库**（同一数据卷），进程重启、`docker compose down && up` 甚至容器重建后，都能按存档 id 恢复续播——包括补取通道里**尚未确认的显示事件**。
+
+- `POST /sessions/{session_id}/checkpoints`：**保存存档**。请求体 `{"checkpoint_id": "..."}`：
+  - `checkpoint_id` 为**非空字符串**：缺失、`null`、非字符串（数字、布尔等不做隐式转换）、空字符串或纯空白一律 **422**；
+  - 仅限**已开启补取通道且自动播放非运行**（`idle`/`paused`/`blocked`）的会话：未开通道返回 **409**（`detail.reason: channel_missing`），运行中返回 **409**（`detail.reason: autoplay_running`，先暂停再保存）；
+  - 存档内容：完整快照（场景 id、源版本、字幕、分轨、changes）、游标、隐藏说话人集合、补取通道未确认事件队列与 `next_seq`/`acked_seq`/`max_returned_seq`、自动播放状态；
+  - 快照构建与落库在同一会话锁内完成，与同会话的推进、事件推进、隐藏切换、补取、接纳、结束**完整串行**；**成功不结束会话**（会话继续照常播放），**失败不留存档**（同名冲突、落库异常都不会留下或改动存档）；
+  - 同名存档已存在返回 **409**（存档只增不改、不可覆盖）；未知或已结束会话返回 **404**；
+  - 成功响应给出存档坐标：`checkpoint_id`、保存时的 `cursor_ms`/`status`、未确认事件数 `queued_events` 与 `next_seq`/`acked_seq`/`max_returned_seq`。
+- `POST /checkpoints/{checkpoint_id}/restore`：**恢复续播**（无请求体）。按存档 id 恢复为**全新 session_id** 的独立会话：
+  - 快照、游标、隐藏集合、通道事件与序号/确认边界全部取自存档，**不读取当前场景**（不纳入存档之后的场景修订）；后续事件从 `next_seq` 继续编号；
+  - 未启动（`idle`）的存档恢复后仍未启动；**暂停或阻塞的存档恢复为 `paused`**——用 `/autoplay/resume` 续播时按既有规则从保留游标重新计时，**不追赶离线（含停机）时间**；
+  - 恢复出的队列**计入共享容量**（`CHANNEL_EVENT_LIMIT`）：容量不足返回 **503**，此时不创建会话、不留容量占用，确认前缀或结束会话释放容量后可用同一存档重试；并发恢复不会突破总额；
+  - 存档只增不改：**可重复恢复**，每次得到相互独立的新会话，后续推进、隐藏、补取、结束都不改存档或其他会话；
+  - 未知存档返回 **404**；空白存档 id 返回 **422**；成功响应返回新 `session_id`、完整快照（含隐藏集合）与播放状态（`status`：`idle` 或 `paused`）。
+
+### 示例 31：存档 → 重启 → 恢复 → 补取 → 续播
+
+下面脚本可直接复制执行：创建场景与会话、开通道、播放到 1000 并确认前 3 条事件 → 隐藏 Alice（产生未确认的第 4 条）→ 保存存档 → **重启服务** → 按存档恢复 → 补取未确认事件 → 续播。
+
+```bash
+# 1) 场景（s1[0,1000)、s2[800,3000) 锁轨 2、s3[1000,2500)）+ 会话 + 开通道
+curl -s -X PUT http://localhost:8080/scenes/scene-cp \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-cp"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+
+# 2) 事件推进到 1000（seq 1~3 入队），补取并确认前 3 条
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}' >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}' >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 3}' >/dev/null
+
+# 3) 隐藏 Alice：s3 在游标处活动，产生未确认的第 4 条事件（exit@1000）
+curl -s -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": ["Alice"]}' >/dev/null
+
+# 4) 保存存档 cp-1（成功不结束会话，会话可继续播放）
+curl -s -X POST http://localhost:8080/sessions/$SID/checkpoints \
+  -H 'Content-Type: application/json' -d '{"checkpoint_id": "cp-1"}'
+```
+
+```json
+{
+  "checkpoint_id": "cp-1",
+  "session_id": "…",
+  "scene_id": "scene-cp",
+  "source_revision": 1,
+  "cursor_ms": 1000,
+  "status": "idle",
+  "queued_events": 1,
+  "next_seq": 5,
+  "acked_seq": 3,
+  "max_returned_seq": 3
+}
+```
+
+```bash
+# 5) 重启服务：内存会话全部丢失（旧会话一律 404），存档在数据卷中保留
+docker compose restart
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'   # 404
+
+# 6) 按存档恢复为全新会话（不读取当前场景）
+curl -s -X POST http://localhost:8080/checkpoints/cp-1/restore
+```
+
+```json
+{
+  "session_id": "新 id",
+  "checkpoint_id": "cp-1",
+  "scene_id": "scene-cp",
+  "source_revision": 1,
+  "cursor_ms": 1000,
+  "track_count": 2,
+  "changes": 0,
+  "subtitles": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000, "locked_track": null},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500, "locked_track": null}
+  ],
+  "assignments": [
+    {"id": "s1", "track": 1},
+    {"id": "s2", "track": 2},
+    {"id": "s3", "track": 1}
+  ],
+  "hidden_speakers": ["Alice"],
+  "status": "idle"
+}
+```
+
+```bash
+NEW_SID=<上一步返回的 session_id>
+
+# 7) 补取：未确认的第 4 条原样保留，确认边界不变（ack 5 越界 422）
+curl -s -X POST http://localhost:8080/sessions/$NEW_SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 3}'
+# {"…","acked_seq":3,"events":[{"seq":4,"id":"s3","speaker":"Alice","track":1,"time_ms":1000,"type":"exit"}]}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$NEW_SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 5}'            # 422（已返回最大 seq 为 4）
+curl -s -X POST http://localhost:8080/sessions/$NEW_SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 4}' >/dev/null # 确认第 4 条
+
+# 8) 续播：后续事件从 next_seq（5）继续编号（Alice 隐藏，只记录 s2 的退出）
+curl -s -X POST http://localhost:8080/sessions/$NEW_SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3000}' >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$NEW_SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 4}'
+# {"…","acked_seq":4,"events":[{"seq":5,"id":"s2","speaker":"Bob","track":2,"time_ms":3000,"type":"exit"}]}
+```
+
+存档**不读取当前场景**：第 5 步之后即使把 `scene-cp` 修订到 revision 2，恢复出的会话仍是存档时接纳的 revision 1 快照（`source_revision: 1`）；恢复出的会话是普通会话，需要跟进修订时再调 `/accept`。存档**可重复恢复**：再次 `POST /checkpoints/cp-1/restore` 得到另一个相互独立的新会话，互不影响，存档本身不被改动。
+
+### 示例 32：自动播放存档——暂停/阻塞恢复为暂停，续播不追赶离线时间
+
+```bash
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-cp"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/start >/dev/null
+sleep 0.3
+
+# 运行中不能存档：409（reason: autoplay_running）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/checkpoints \
+  -H 'Content-Type: application/json' -d '{"checkpoint_id": "cp-auto"}'   # 409
+
+# 暂停后保存（阻塞 blocked 的会话同样可存，恢复后一律为 paused）
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/pause
+# {"…","status":"paused","cursor_ms":301}
+curl -s -X POST http://localhost:8080/sessions/$SID/checkpoints \
+  -H 'Content-Type: application/json' -d '{"checkpoint_id": "cp-auto"}'
+# {"…","status":"paused","cursor_ms":301, …}
+
+docker compose restart   # 停机时间不计入任何计时段
+
+# 恢复：paused 存档恢复为 paused，游标停在保留值
+curl -s -X POST http://localhost:8080/checkpoints/cp-auto/restore
+# {"session_id":"新 id", …, "status":"paused","cursor_ms":301}
+
+# 显式续播：从保留游标重新计时，不追赶停机与暂停期间流逝的时间
+NEW_SID=<恢复返回的 session_id>
+curl -s -X POST http://localhost:8080/sessions/$NEW_SID/autoplay/resume
+# {"…","status":"running","cursor_ms":301}
+sleep 0.1
+curl -s http://localhost:8080/sessions/$NEW_SID/autoplay
+# {"…","status":"running","cursor_ms":约 400} —— 而不是 301 加上全部离线时间
+```
+
+**容量与重试**：恢复出的未确认队列计入 `CHANNEL_EVENT_LIMIT`。容量不足时恢复返回 503（不创建会话、不留容量占用）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/checkpoints/cp-1/restore
+# HTTP/1.1 503 Service Unavailable
+# {"detail":{"message":"补取通道未确认事件总量已达上限：存档队列无法完整恢复，未创建会话；确认前缀或结束会话释放容量后可重试",
+#            "limit":1024,"requested":1,"available":0}}
+```
+
+确认其他会话的事件前缀或结束其他会话释放容量后，用同一存档重试即可；同名存档重复保存返回 409，未知存档恢复返回 404，空白存档 id 返回 422。
+
 ## 本地开发与测试（不使用 Docker）
 
 需 Python 3.11+：
@@ -1936,6 +2112,7 @@ tests/
   test_channel.py        # 补取通道：开启/重复开启、三类操作入队与短字幕、ack 边界与不回退、重复补取不变、结束清除、404/409/422、串行化
   test_channel_limit.py  # 通道共享容量：默认/配置/非法拒绝启动、生产原子申请与满额 503（游标/隐藏集合/seq/队列不变）、无事件与未开启通道不占、确认前缀释放/读取与旧确认不释放、结束一次性释放、跨会话总额、并发不越限/不死锁/不泄漏、重试
   test_autoplay.py       # 自动播放：状态机 409/404、真实时间推进与本段起点、暂停不计时/恢复不追赶、满额整批转 blocked（游标/seq/队列不变）/确认后显式恢复、运行中手动推进 409、其他操作串行、结束停止驱动并释放容量（含注入时钟的确定性管理器测试）、启动/暂停恢复/阻塞恢复的等锁不计时回归（可控时钟 + 线程交错）与无竞争路径
+  test_checkpoint.py     # 播放存档：保存前提 409/404/422、成功不结束会话、失败不留存档、同名 409；恢复保留快照/游标/隐藏集合/事件与确认边界、后续从 next_seq 编号、不读取当前场景、可重复恢复且互不影响；idle 仍 idle、paused/blocked 恢复为 paused、续播不追赶离线时间；恢复计入共享容量（不足 503 且不留会话或容量占用、并发不超额、释放后可重试）；跨重启（重置管理器）续播
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data；CHANNEL_EVENT_LIMIT 配置通道共享容量（默认 1024）
 requirements.txt / requirements-dev.txt

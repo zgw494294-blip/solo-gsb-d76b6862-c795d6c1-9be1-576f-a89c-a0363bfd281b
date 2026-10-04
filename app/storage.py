@@ -11,6 +11,12 @@
 片段另存（clip）与场景拼接（concat）创建新场景时同样在单个
 BEGIN IMMEDIATE 事务内核对全部源版本并占用目标：版本核对与目标
 创建一同生效，失败不留目标、不改源。
+
+播放存档（checkpoint）把播放会话的完整状态（快照、游标、隐藏集合、
+补取通道未确认事件与序号/确认边界、自动播放状态）作为一个 JSON
+文档按非空 checkpoint_id 落库：写入在单个 BEGIN IMMEDIATE 事务内
+先核对名称未占用再 INSERT，同名冲突抛 CheckpointExists 且不改动
+已有存档；存档只增不改，可重复读取恢复为相互独立的新会话。
 """
 from __future__ import annotations
 
@@ -55,6 +61,16 @@ class SourceSceneMissing(Exception):
         super().__init__(f"源场景 {scene_id!r} 不存在")
 
 
+class CheckpointExists(Exception):
+    """同名播放存档已存在：存档只增不改，保存必须使用未占用的 checkpoint_id。"""
+
+    def __init__(self, checkpoint_id: str) -> None:
+        self.checkpoint_id = checkpoint_id
+        super().__init__(
+            f"播放存档 {checkpoint_id!r} 已存在，存档不可覆盖"
+        )
+
+
 @dataclass
 class SceneRecord:
     scene_id: str
@@ -94,6 +110,15 @@ class SceneStore:
                     assignments   TEXT    NOT NULL,
                     changes       INTEGER NOT NULL,
                     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    payload       TEXT NOT NULL,
+                    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 )
                 """
             )
@@ -336,6 +361,56 @@ class SceneStore:
             raise
         finally:
             conn.close()
+
+    def commit_checkpoint(
+        self, checkpoint_id: str, payload: Dict[str, Any]
+    ) -> None:
+        """在单个 BEGIN IMMEDIATE 事务内确认名称未占用并写入播放存档。
+
+        payload 为存档的完整内容（会话快照、游标、隐藏集合、补取通道
+        未确认事件与序号/确认边界、自动播放状态），作为一个 JSON 文档
+        整体落库。同名存档已存在时抛 CheckpointExists，已有存档不被
+        改动（存档只增不改）；任一失败都在提交前回滚，不留存档。
+        名称核对与 INSERT 被同一把写锁串行化，并发保存同名存档最多
+        一次成功。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT checkpoint_id FROM checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+            if row is not None:
+                raise CheckpointExists(checkpoint_id)
+            conn.execute(
+                "INSERT INTO checkpoints (checkpoint_id, payload) VALUES (?, ?)",
+                (checkpoint_id, json.dumps(payload, ensure_ascii=False)),
+            )
+            conn.commit()
+        except CheckpointExists:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_checkpoint(self, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+        """按 checkpoint_id 读取播放存档的完整内容；不存在返回 None。
+
+        单行快照读取（WAL 下一条 SELECT 对同一行取一致版本），
+        不会读到某次提交的部分内容；读取不修改存档，可重复读取恢复。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
 
     def get_scene(self, scene_id: str) -> Optional[SceneRecord]:
         """按 scene_id 读取最近一次成功修订；不存在返回 None。
