@@ -1,0 +1,21 @@
+services:
+  subtitle-tracks:
+    build: .
+    image: subtitle-track-api:latest
+    container_name: subtitle-track-api
+    ports:
+      - "8080:8080"
+    environment:
+      # 容器内数据库文件路径（与 Dockerfile 的默认值一致）
+      SCENES_DB_PATH: /data/scenes.db
+      # 补取通道共享容量：单进程内所有会话“未确认事件总量”的上限。
+      # 正整数，缺省 1024；0、负数、小数或非数字等非法配置（含空值）
+      # 会让容器启动失败（拒绝启动）。改大可缓冲更多未确认事件。
+      CHANNEL_EVENT_LIMIT: "1024"
+    volumes:
+      # 具名卷持久化 SQLite 场景数据；容器重启甚至重新创建后仍可读取场景
+      - scenes-data:/data
+    restart: unless-stopped
+
+volumes:
+  scenes-data:
